@@ -1,0 +1,182 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>全球股市最简实时与风险示例</title>
+  <style>
+    body{font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, "PingFang SC", "Hiragino Sans GB", "Noto Sans CJK SC", "Microsoft YaHei", sans-serif; margin:24px; line-height:1.5}
+    h1{font-size:20px; margin:0 0 12px 0}
+    .note{font-size:12px; color:#555; margin-bottom:12px}
+    table{border-collapse:collapse; width:100%; max-width:960px}
+    th,td{border:1px solid #ddd; padding:8px; font-size:14px; text-align:left}
+    th{background:#f7f7f7}
+    tr:hover{background:#fafafa}
+    .pill{font-size:12px; padding:2px 8px; border-radius:999px; border:1px solid #ccc; color:#333; background:#fff; cursor:pointer}
+    .risk-low{background:#e9f7ef; border-color:#c7e8d4}
+    .risk-med{background:#fff6e5; border-color:#ffe1a3}
+    .risk-high{background:#fdecea; border-color:#fac1bb}
+    .mono{font-variant-numeric: tabular-nums; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;}
+    .small{font-size:12px; color:#666}
+    .right{float:right}
+    .muted{color:#888}
+  </style>
+</head>
+<body>
+  <h1>全球股市最简：实时价格 & 简易风险（HTML 单文件）</h1>
+  <div class="note">
+    • 数据源：<a href="https://stooq.com/" target="_blank" rel="noopener">Stooq</a> 免费行情（延迟/盘中，视交易所而定）。<br/>
+    • 若浏览器报 <strong>CORS</strong> 错误，请用本地静态服务器打开（如 VS Code 的 “Live Server”）或部署到 GitHub Pages；少数网络环境可能屏蔽跨域。<br/>
+    • 点击“计算风险”按需拉取近 60 日历史数据，按 95% 置信度给出 1 日 VaR（基于历史波动率，<span class="muted">仅教学示例</span>）。
+  </div>
+
+  <table id="tbl">
+    <thead>
+      <tr>
+        <th>指数</th>
+        <th>最新价</th>
+        <th>日期</th>
+        <th>时间</th>
+        <th>成交量</th>
+        <th>简易风险 (VaR@95%)</th>
+        <th>操作</th>
+      </tr>
+    </thead>
+    <tbody></tbody>
+  </table>
+
+  <p class="small muted">更新频率：60 秒。VaR=价格×1.65×σ<sub>日</sub>；σ<sub>日</sub>由近 60 个交易日对数收益率的标准差估算。</p>
+
+<script>
+// ---- 配置：常见全球指数（Stooq 符号） ----
+const indices = [
+  {name: "S&P 500", symbol: "^SPX"},
+  {name: "Dow Jones", symbol: "^DJI"},
+  {name: "Nasdaq Composite", symbol: "^NDQ"},
+  {name: "FTSE 100", symbol: "^UKX"},
+  {name: "DAX", symbol: "^DAX"},
+  {name: "Nikkei 225", symbol: "^NKX"},
+  {name: "Hang Seng", symbol: "^HSI"},
+  {name: "SSE Composite", symbol: "^SHC"}
+];
+
+// ---- 工具：简易 CSV 解析（适用于本例格式） ----
+function parseCSV(text){
+  const lines = text.trim().split(/\r?\n/);
+  const header = lines.shift().split(",");
+  return lines.map(line => {
+    const cols = line.split(",");
+    const obj = {};
+    header.forEach((h, i) => obj[h.trim()] = (cols[i] ?? "").trim());
+    return obj;
+  });
+}
+
+// ---- 抓取当前报价（Stooq 轻量 CSV）----
+// 参考： https://stooq.com/q/l/?s=%5Espx&f=sd2t2ohlcv&h&e=csv
+async function fetchQuotes(symbols){
+  const encodedList = symbols.map(s => encodeURIComponent(s)).join(",");
+  const url = `https://stooq.com/q/l/?s=${encodedList}&f=sd2t2ohlcv&h&e=csv`;
+  const res = await fetch(url);
+  if(!res.ok) throw new Error("报价请求失败: " + res.status);
+  const csv = await res.text();
+  return parseCSV(csv); // 数组：[{Symbol, Date, Time, Open, High, Low, Close, Volume}, ...]
+}
+
+// ---- 抓取历史日线 CSV（用于计算波动率） ----
+// 参考： https://stooq.com/q/d/l/?s=%5Espx&i=d
+async function fetchHistoryDaily(symbol, n=80){
+  const url = `https://stooq.com/q/d/l/?s=${encodeURIComponent(symbol)}&i=d`;
+  const res = await fetch(url);
+  if(!res.ok) throw new Error("历史数据请求失败: " + res.status);
+  const txt = await res.text();
+  const lines = txt.trim().split(/\r?\n/);
+  lines.shift(); // 去掉表头
+  // 取最近 n 行（末尾为最近）
+  const rows = lines.slice(-n).map(line => {
+    const [date, open, high, low, close, volume] = line.split(",");
+    return {date, close: parseFloat(close)};
+  }).filter(r => Number.isFinite(r.close));
+  return rows;
+}
+
+// ---- 简易 VaR 计算：基于近 60 日对数收益率的标准差 ----
+function calcVar95(price, closes){
+  if(closes.length < 30) return { varAbs: null, varPct: null };
+  const ret = [];
+  for(let i=1;i<closes.length;i++){
+    const r = Math.log(closes[i].close / closes[i-1].close);
+    if(Number.isFinite(r)) ret.push(r);
+  }
+  if(ret.length < 20) return { varAbs: null, varPct: null };
+  const mean = ret.reduce((a,b)=>a+b,0)/ret.length;
+  const variance = ret.reduce((s, x)=> s + (x-mean)*(x-mean), 0) / (ret.length - 1);
+  const sigmaDaily = Math.sqrt(variance); // 日波动率
+  const z = 1.65; // 约 95% 单尾
+  const varPct = z * sigmaDaily; // 1 日 VaR 百分比（近似）
+  const varAbs = price * varPct;
+  return { varAbs, varPct };
+}
+
+// ---- 渲染表格 ----
+function renderRows(quotes){
+  const tbody = document.querySelector("#tbl tbody");
+  tbody.innerHTML = "";
+  quotes.forEach(q => {
+    const tr = document.createElement("tr");
+    tr.id = `row-${q.Symbol}`;
+    tr.innerHTML = `
+      <td>${indices.find(x=>x.symbol===q.Symbol)?.name ?? q.Symbol} <span class="muted mono">(${q.Symbol})</span></td>
+      <td class="mono" data-field="close">${q.Close}</td>
+      <td class="mono">${q.Date}</td>
+      <td class="mono">${q.Time}</td>
+      <td class="mono">${q.Volume}</td>
+      <td class="mono" data-field="risk"><span class="muted">—</span></td>
+      <td><button class="pill" data-action="risk" data-symbol="${q.Symbol}">计算风险</button></td>
+    `;
+    tbody.appendChild(tr);
+  });
+}
+
+// ---- 风险按钮事件 ----
+document.addEventListener("click", async (e) => {
+  const btn = e.target.closest("button[data-action='risk']");
+  if(!btn) return;
+  const symbol = btn.getAttribute("data-symbol");
+  const row = document.getElementById(`row-${symbol}`);
+  const priceCell = row.querySelector("[data-field='close']");
+  const riskCell = row.querySelector("[data-field='risk']");
+  const price = parseFloat(priceCell.textContent.replace(/,/g,""));
+  riskCell.innerHTML = `<span class="small">计算中…</span>`;
+  try{
+    const hist = await fetchHistoryDaily(symbol, 80);
+    const {varAbs, varPct} = calcVar95(price, hist);
+    if(varAbs == null){
+      riskCell.innerHTML = `<span class="small">数据不足</span>`;
+      return;
+    }
+    const pct = (varPct*100).toFixed(2) + "%";
+    let cls = "risk-low", label = "低";
+    if(varPct >= 0.015 && varPct < 0.025){ cls = "risk-med"; label = "中"; }
+    if(varPct >= 0.025){ cls = "risk-high"; label = "高"; }
+    riskCell.innerHTML = `<span class="pill ${cls} mono">VaR≈ ${pct}（${label}）</span>`;
+  }catch(err){
+    riskCell.innerHTML = `<span class="small" title="${err.message}">失败（可能 CORS 或网络问题）</span>`;
+  }
+});
+
+// ---- 首次加载 + 定时刷新 ----
+async function loadAndRender(){
+  try{
+    const quotes = await fetchQuotes(indices.map(x => x.symbol));
+    renderRows(quotes);
+  }catch(err){
+    const tbody = document.querySelector("#tbl tbody");
+    tbody.innerHTML = `<tr><td colspan="7" class="small">加载失败：${err.message}。若为 CORS，请使用本地服务器或部署到 GitHub Pages。</td></tr>`;
+  }
+}
+loadAndRender();
+setInterval(loadAndRender, 60_000);
+</script>
+</body>
+</html>
